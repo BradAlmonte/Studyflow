@@ -1,0 +1,253 @@
+import { useEffect, useMemo, useRef, useState } from "react";
+
+// StudyFlow — Focus/Rest Pomodoro Timer with black & red dynamic theme
+
+const clamp = (n, min, max) => Math.min(Math.max(n, min), max);
+const pad = (n) => String(n).padStart(2, "0");
+const formatRest = (valMins) => {
+  const total = Math.round(valMins * 60);
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  return s ? `${m}:${pad(s)}` : `${m}`;
+};
+
+const STORAGE_KEYS = { settings: "studyflow.settings.v1", state: "studyflow.state.v1" };
+
+const phaseLabel = { focus: "Focus", rest: "Rest" };
+const WORK_PRESETS = [20, 30, 45, 60];
+
+const defaultSettings = {
+  workMins: 25,
+  autoStartNext: false,
+  soundOn: true,
+  notifyOn: false,
+  useCustom: false,
+};
+
+export default function StudyFlow() {
+  const [settings, setSettings] = useState(() => {
+    const saved = localStorage.getItem(STORAGE_KEYS.settings);
+    return saved ? { ...defaultSettings, ...JSON.parse(saved) } : defaultSettings;
+  });
+  const restMins = useMemo(() => settings.workMins / 4, [settings.workMins]);
+
+  const [phase, setPhase] = useState(() => {
+    const saved = localStorage.getItem(STORAGE_KEYS.state);
+    return saved ? JSON.parse(saved).phase : "focus";
+  });
+  const [remaining, setRemaining] = useState(() => {
+    const saved = localStorage.getItem(STORAGE_KEYS.state);
+    if (saved) return JSON.parse(saved).remaining;
+    return Math.round(defaultSettings.workMins * 60);
+  });
+  const [running, setRunning] = useState(false);
+  const [sessionCount, setSessionCount] = useState(() => {
+    const saved = localStorage.getItem(STORAGE_KEYS.state);
+    return saved ? JSON.parse(saved).sessionCount : 0;
+  });
+
+  const intervalRef = useRef(null);
+  const lastTickRef = useRef(0);
+
+  const totalForPhase = useMemo(() => (phase === "focus" ? settings.workMins : restMins) * 60, [phase, settings.workMins, restMins]);
+  const progress = useMemo(() => 1 - remaining / totalForPhase, [remaining, totalForPhase]);
+
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEYS.settings, JSON.stringify(settings));
+  }, [settings]);
+
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEYS.state, JSON.stringify({ phase, remaining, sessionCount }));
+  }, [phase, remaining, sessionCount]);
+
+  useEffect(() => {
+    if (!running) {
+      if (intervalRef.current) clearInterval(intervalRef.current);
+      return;
+    }
+    lastTickRef.current = performance.now();
+    intervalRef.current = setInterval(() => {
+      const now = performance.now();
+      const delta = (now - lastTickRef.current) / 1000;
+      lastTickRef.current = now;
+      setRemaining((r) => Math.max(0, r - delta));
+    }, 250);
+    return () => clearInterval(intervalRef.current);
+  }, [running]);
+
+  useEffect(() => {
+    if (remaining > 0) return;
+
+    if (settings.soundOn) beep();
+    if (settings.notifyOn && "Notification" in window && Notification.permission === "granted") {
+      new Notification(`${phaseLabel[phase]} complete`, { body: `Next: ${phaseLabel[phase === "focus" ? "rest" : "focus"]}` });
+    }
+
+    setRunning(false);
+    setTimeout(() => {
+      if (phase === "focus") setSessionCount((c) => c + 1);
+      const next = phase === "focus" ? "rest" : "focus";
+      setPhase(next);
+      setRemaining(((next === "focus") ? settings.workMins : restMins) * 60);
+      if (settings.autoStartNext) setRunning(true);
+    }, 200);
+  }, [remaining]);
+
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.target instanceof HTMLInputElement) return;
+      const k = e.key.toLowerCase();
+      if (e.code === "Space") { e.preventDefault(); toggle(); }
+      else if (k === "r") { reset(); }
+      else if (k === "s") { skip(); }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [phase, settings, remaining, running]);
+
+  const toggle = () => setRunning((v) => !v);
+  const reset = () => { setRunning(false); setRemaining(((phase === "focus") ? settings.workMins : restMins) * 60); };
+  const skip = () => setRemaining(0);
+  const setPhaseAndReset = (p) => { setPhase(p); setRunning(false); setRemaining(((p === "focus") ? settings.workMins : restMins) * 60); };
+
+  const usePreset = (mins) => {
+    setSettings((s) => ({ ...s, workMins: mins, useCustom: false }));
+    setRemaining((old) => {
+      const newTotal = ((phase === "focus") ? mins : mins / 4) * 60;
+      const ratio = clamp(totalForPhase ? old / totalForPhase : 1, 0, 1);
+      return Math.round(newTotal * ratio);
+    });
+  };
+
+  const enableCustom = () => setSettings((s) => ({ ...s, useCustom: true }));
+  const updateCustomWork = (val) => {
+    const v = Math.max(1, Number(val) || 1);
+    setSettings((s) => ({ ...s, workMins: v }));
+    setRemaining((old) => {
+      const newTotal = ((phase === "focus") ? v : v / 4) * 60;
+      const ratio = clamp(totalForPhase ? old / totalForPhase : 1, 0, 1);
+      return Math.round(newTotal * ratio);
+    });
+  };
+
+  const timeStr = useMemo(() => {
+    const s = Math.round(remaining);
+    const m = Math.floor(s / 60);
+    const sec = s % 60;
+    return `${pad(m)}:${pad(sec)}`;
+  }, [remaining]);
+
+  const requestNotif = () => {
+    if (!("Notification" in window)) return;
+    if (Notification.permission === "default") Notification.requestPermission();
+  };
+
+  const beep = () => {
+    try {
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const o = ctx.createOscillator();
+      const g = ctx.createGain();
+      o.type = "sine"; o.frequency.value = 880; o.connect(g); g.connect(ctx.destination);
+      g.gain.setValueAtTime(0.0001, ctx.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.2, ctx.currentTime + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.3);
+      o.start(); o.stop(ctx.currentTime + 0.35);
+    } catch {}
+  };
+
+  return (
+    <div className="min-h-screen relative text-neutral-100 flex items-center justify-center p-6 overflow-hidden">
+      {/* Animated black-red background design */}
+      <div className="absolute inset-0 -z-10 bg-gradient-to-br from-black via-red-950 to-black animate-pulse-slow"></div>
+      <div className="absolute top-1/4 left-1/3 w-96 h-96 bg-red-600/20 rounded-full blur-3xl animate-pulse"></div>
+      <div className="absolute bottom-1/3 right-1/4 w-[30rem] h-[30rem] bg-red-700/10 rounded-full blur-3xl animate-pulse-slow"></div>
+
+      <div className="w-full max-w-3xl bg-black/50 backdrop-blur-xl border border-red-800/50 rounded-3xl shadow-2xl p-6 sm:p-10">
+        <header className="flex items-center justify-between mb-6">
+          <h1 className="text-2xl sm:text-3xl font-semibold tracking-tight text-red-400 drop-shadow">StudyFlow</h1>
+          <div className="text-sm text-neutral-400">Space: start/pause · R: reset · S: skip</div>
+        </header>
+
+        <div className="rounded-2xl p-6 sm:p-8 bg-gradient-to-br from-red-900/40 to-black/60 border border-red-700/40">
+          <div className="grid gap-6 sm:grid-cols-[1fr_auto] items-center">
+            <div>
+              <div className="flex flex-wrap items-center gap-2 mb-3">
+                {["focus", "rest"].map((p) => (
+                  <button key={p} onClick={() => setPhaseAndReset(p)} className={`px-3 py-1.5 rounded-xl text-sm backdrop-blur border transition-all duration-200 ${phase === p ? 'bg-red-700/40 border-red-500/50' : 'bg-black/40 border-red-900/50 hover:bg-red-900/40'}`} aria-pressed={phase === p}>{phaseLabel[p]}</button>
+                ))}
+              </div>
+
+              <div className="text-6xl sm:text-7xl font-mono tabular-nums drop-shadow-sm select-none text-red-300">{timeStr}</div>
+              <div className="mt-3 h-2 w-full bg-red-900/40 rounded-full overflow-hidden">
+                <div className="h-full bg-red-500 transition-all" style={{ width: `${clamp(progress * 100, 0, 100)}%` }} />
+              </div>
+
+              <div className="mt-4 flex flex-wrap items-center gap-3">
+                <button onClick={toggle} className="px-4 py-2 rounded-xl bg-red-600 text-white font-medium hover:bg-red-500">{running ? 'Pause' : 'Start'}</button>
+                <button onClick={reset} className="px-4 py-2 rounded-xl border border-red-600 text-red-300 hover:bg-red-900/40">Reset</button>
+                <button onClick={skip} className="px-4 py-2 rounded-xl border border-red-600 text-red-300 hover:bg-red-900/40">Skip</button>
+                <div className="ml-auto flex items-center gap-2 text-sm text-red-300">
+                  Sessions: <span className="font-semibold">{sessionCount}</span>
+                  <button onClick={() => setSessionCount((c) => c + 1)} className="px-2 py-1 rounded-lg border border-red-600 hover:bg-red-900/40 text-xs">+1</button>
+                  <button onClick={() => setSessionCount(0)} className="px-2 py-1 rounded-lg border border-red-600 hover:bg-red-900/40 text-xs">Reset</button>
+                </div>
+              </div>
+            </div>
+
+            <div className="bg-black/40 border border-red-900/40 rounded-2xl p-4 w-full sm:w-80">
+              <h2 className="font-semibold mb-3 text-red-400">Settings</h2>
+              <div className="flex flex-wrap gap-2 mb-3">
+                {WORK_PRESETS.map((m) => {
+                  const active = !settings.useCustom && settings.workMins === m;
+                  const rest = m / 4;
+                  return (
+                    <button key={m} onClick={() => usePreset(m)} className={`px-3 py-1.5 rounded-xl text-sm border transition ${active ? 'bg-red-700/40 border-red-500/50' : 'bg-black/40 border-red-900/50 hover:bg-red-900/40'}`} title={`${m} min focus · ${formatRest(rest)} rest`}>
+                      {m}·{formatRest(rest)}
+                    </button>
+                  );
+                })}
+                <button onClick={enableCustom} className={`px-3 py-1.5 rounded-xl text-sm border transition ${settings.useCustom ? 'bg-red-700/40 border-red-500/50' : 'bg-black/40 border-red-900/50 hover:bg-red-900/40'}`}>Custom</button>
+              </div>
+
+              {settings.useCustom && (
+                <div className="space-y-2 text-sm">
+                  <label className="flex flex-col gap-1">
+                    <span className="opacity-90 text-red-300">Focus (mins)</span>
+                    <input type="number" step="0.5" min={1} className="bg-black/60 border border-red-800 rounded-xl px-3 py-2 focus:outline-none focus:ring-2 focus:ring-red-600" value={settings.workMins} onChange={(e) => updateCustomWork(e.target.value)} />
+                  </label>
+                  <div className="text-red-300">Rest auto-set to <span className="font-medium">{formatRest(restMins)}</span> (4:1)</div>
+                </div>
+              )}
+
+              <div className="mt-4 space-y-2 text-sm text-red-300">
+                <ToggleField label="Auto-start next" value={settings.autoStartNext} onChange={(v) => setSettings((s) => ({ ...s, autoStartNext: v }))} />
+                <ToggleField label="Sound" value={settings.soundOn} onChange={(v) => setSettings((s) => ({ ...s, soundOn: v }))} />
+                <ToggleField label="Desktop notifications" value={settings.notifyOn} onChange={(v) => { if (v) requestNotif(); setSettings((s) => ({ ...s, notifyOn: v })); }} />
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <footer className="mt-6 text-xs text-red-400 flex items-center justify-between">
+          <div>4:1 ratio — your settings are saved locally.</div>
+          <a className="underline hover:text-red-200" href="#" onClick={(e) => { e.preventDefault(); localStorage.clear(); location.reload(); }}>Reset all</a>
+        </footer>
+      </div>
+    </div>
+  );
+}
+
+function ToggleField({ label, value, onChange }) {
+  return (
+    <button type="button" role="switch" aria-checked={value} onClick={() => onChange(!value)} className={`w-full flex items-center justify-between px-3 py-2 rounded-xl border transition ${value ? 'bg-red-800/40 border-red-600' : 'bg-black/40 border-red-900'}`}>
+      <span className="text-sm text-red-300">{label}</span>
+      <span className={`inline-flex h-6 w-11 items-center rounded-full transition ${value ? 'bg-red-600' : 'bg-red-900/50'}`}>
+        <span className={`h-5 w-5 bg-black rounded-full mx-1 transition-transform ${value ? 'translate-x-5' : 'translate-x-0'}`} />
+      </span>
+    </button>
+  );
+}
+
+// Custom pulse animation (add to tailwind config if external):
+// @keyframes pulse-slow { 0%,100%{opacity:.6;} 50%{opacity:1;} }
+// .animate-pulse-slow { animation: pulse-slow 6s ease-in-out infinite; }
